@@ -143,6 +143,10 @@ else ifeq ($(platform), funkey-s)
 	LDFLAGS += -fPIC
 	LDFLAGS += -lSDL_image -lSDL_ttf # For fk_menu
 	core_platform = unix-armv7-hardfloat-neon
+else ifeq ($(platform), pb)
+	SOURCES += plat_pb.c
+	CFLAGS += -DCONTENT_DIR='"/mnt"' -march=mips32r2 -mhard-float
+	LDFLAGS += -fPIC
 else ifeq ($(platform), unix)
 	SOURCES += plat_linux.c
 	LDFLAGS += -fPIE
