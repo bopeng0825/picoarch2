@@ -1,6 +1,7 @@
 #include <SDL/SDL.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <directfb.h>
 #include "core.h"
 #include "libpicofe/fonts.h"
 #include "libpicofe/plat.h"
@@ -9,7 +10,15 @@
 #include "scale.h"
 #include "util.h"
 
+#define PICOARCH_DISABLE_AUDIO 0
+
 static SDL_Surface* screen;
+static IDirectFB            *dfb       = NULL;
+static IDirectFBSurface     *primary   = NULL;
+static IDirectFBSurface     *source    = NULL;
+static int                   dfb_w = 0, dfb_h = 0;
+static int                   source_surf_w = 0, source_surf_h = 0;
+static int                   source_w = 0, source_h = 0;
 
 struct audio_state {
 	unsigned buf_w;
@@ -51,6 +60,41 @@ static uint64_t plat_get_ticks_us_u64(void) {
 	return ret;
 }
 
+/* ------------------------------------------------------------------ */
+/*  DFB source surface 管理：按需重建                                  */
+/* ------------------------------------------------------------------ */
+static void ensure_source_size(int w, int h)
+{
+	if (w == source_surf_w && h == source_surf_h)
+		return;
+
+	if (source) {
+		source->Release(source);
+		source = NULL;
+	}
+
+	DFBSurfaceDescription sdsc = {
+		.flags       = DSDESC_WIDTH | DSDESC_HEIGHT | DSDESC_PIXELFORMAT,
+		.width       = w,
+		.height      = h,
+		.pixelformat = DSPF_RGB16,
+	};
+
+	if (dfb->CreateSurface(dfb, &sdsc, &source) != DFB_OK) {
+		PA_ERROR("ensure_source_size: CreateSurface %dx%d failed\n", w, h);
+		source = NULL;
+		source_surf_w = source_surf_h = 0;
+		return;
+	}
+
+	source_surf_w = w;
+	source_surf_h = h;
+	PA_INFO("source surface resized to %dx%d\n", w, h);
+}
+
+/* ------------------------------------------------------------------ */
+/*  HUD 消息                                                           */
+/* ------------------------------------------------------------------ */
 static void video_expire_msg(void)
 {
 	msg[0] = '\0';
@@ -74,6 +118,56 @@ static void video_print_msg(uint16_t *dst, uint32_t h, uint32_t pitch, char *msg
 	basic_text_out16_nf(dst, pitch, 2, h - 10, msg);
 }
 
+/* ------------------------------------------------------------------ */
+/*  fb_flip：只做 StretchBlit + Flip，source 已由调用方填好              */
+/* ------------------------------------------------------------------ */
+static void fb_blit(void)
+{
+	if (!source || !primary || source_w == 0 || source_h == 0)
+		return;
+
+	DFBRectangle sr = { 0, 0, source_w, source_h };
+	DFBRectangle dr = { 0, 0, dfb_w, dfb_h };
+	primary->StretchBlit(primary, source, &sr, &dr);
+	primary->Flip(primary, NULL, DSFLIP_NONE);
+}
+
+/*
+ * 菜单专用：把 screen(SDL surface) 内容拷进 source，再 blit 到屏幕。
+ * 菜单分辨率固定为 SCREEN_WIDTH x SCREEN_HEIGHT。
+ */
+static void *fb_flip_menu(void)
+{
+	if (!screen)
+		return NULL;
+
+	ensure_source_size(SCREEN_WIDTH, SCREEN_HEIGHT);
+	source_w = SCREEN_WIDTH;
+	source_h = SCREEN_HEIGHT;
+
+	void *sptr;
+	int spitch;
+	if (source && source->Lock(source, DSLF_WRITE, &sptr, &spitch) == DFB_OK) {
+		const uint8_t *src = (const uint8_t *)screen->pixels;
+		uint8_t       *dst = (uint8_t *)sptr;
+		int row = SCREEN_WIDTH * 2;
+
+		if (spitch == row && screen->pitch == row) {
+			memcpy(dst, src, row * SCREEN_HEIGHT);
+		} else {
+			for (int y = 0; y < SCREEN_HEIGHT; y++)
+				memcpy(dst + y * spitch, src + y * screen->pitch, row);
+		}
+		source->Unlock(source);
+	}
+
+	fb_blit();
+	return screen->pixels;
+}
+
+/* ------------------------------------------------------------------ */
+/*  音频：空写入（调试用，可恢复）                                      */
+/* ------------------------------------------------------------------ */
 static int audio_resample_passthrough(struct audio_frame data) {
 	audio.buf[audio.buf_w++] = data;
 	if (audio.buf_w >= audio.buf_len) audio.buf_w = 0;
@@ -100,12 +194,16 @@ static int audio_resample_nearest(struct audio_frame data) {
 	return consumed;
 }
 
-static void *fb_flip(void)
+/* 空写入：丢弃所有音频帧 */
+void plat_sound_write_null(const struct audio_frame *data, int frames)
 {
-	SDL_Flip(screen);
-	return screen->pixels;
+	(void)data;
+	(void)frames;
 }
 
+/* ------------------------------------------------------------------ */
+/*  截图 / 读图（保持原有逻辑，使用 screen surface）                    */
+/* ------------------------------------------------------------------ */
 void *plat_prepare_screenshot(int *w, int *h, int *bpp)
 {
 	if (w) *w = SCREEN_WIDTH;
@@ -176,7 +274,9 @@ finish:
 	return ret;
 }
 
-
+/* ------------------------------------------------------------------ */
+/*  菜单视频接口：走 screen(SDL) → fb_flip_menu 路径                   */
+/* ------------------------------------------------------------------ */
 void plat_video_menu_enter(int is_rom_loaded)
 {
 	if (g_menuscreen_ptr)
@@ -185,7 +285,7 @@ void plat_video_menu_enter(int is_rom_loaded)
 	SDL_LockSurface(screen);
 	memcpy(g_menubg_src_ptr, screen->pixels, g_menubg_src_h * g_menubg_src_pp * sizeof(uint16_t));
 	SDL_UnlockSurface(screen);
-	g_menuscreen_ptr = fb_flip();
+	g_menuscreen_ptr = fb_flip_menu();
 }
 
 void plat_video_menu_begin(void)
@@ -198,7 +298,7 @@ void plat_video_menu_end(void)
 {
 	menu_end();
 	SDL_UnlockSurface(screen);
-	g_menuscreen_ptr = fb_flip();
+	g_menuscreen_ptr = fb_flip_menu();
 }
 
 void plat_video_menu_leave(void)
@@ -208,7 +308,7 @@ void plat_video_menu_leave(void)
 	SDL_LockSurface(screen);
 	memset(screen->pixels, 0, g_menuscreen_h * g_menuscreen_pp * sizeof(uint16_t));
 	SDL_UnlockSurface(screen);
-	fb_flip();
+	fb_flip_menu();
 	SDL_LockSurface(screen);
 	memset(screen->pixels, 0, g_menuscreen_h * g_menuscreen_pp * sizeof(uint16_t));
 	SDL_UnlockSurface(screen);
@@ -232,24 +332,41 @@ void plat_video_set_msg(const char *new_msg, unsigned priority, unsigned msec)
 	}
 }
 
+/* ------------------------------------------------------------------ */
+/*  游戏帧处理：核心帧直写 DFB source，GE 硬件做缩放                   */
+/* ------------------------------------------------------------------ */
 void plat_video_process(const void *data, unsigned width, unsigned height, size_t pitch) {
-	static int had_msg = 0;
 	frame_dirty = true;
-	SDL_LockSurface(screen);
 
-	if (had_msg) {
-		video_clear_msg(screen->pixels, screen->h, screen->pitch / SCREEN_BPP);
-		had_msg = 0;
+	ensure_source_size(width, height);
+	source_w = width;
+	source_h = height;
+
+	if (source) {
+		void *sptr;
+		int spitch;
+
+		if (source->Lock(source, DSLF_WRITE, &sptr, &spitch) == DFB_OK) {
+			const uint8_t *src = (const uint8_t *)data;
+			uint8_t       *dst = (uint8_t *)sptr;
+			int row = width * 2;
+
+			if ((int)pitch == row && spitch == row) {
+				memcpy(dst, src, row * height);
+			} else {
+				for (unsigned y = 0; y < height; y++)
+					memcpy(dst + y * spitch, src + y * pitch, row);
+			}
+
+			if (msg[0]) {
+				uint16_t *dst16 = (uint16_t *)sptr;
+				int pitch16 = spitch / 2;
+				video_print_msg(dst16, height, pitch16, msg);
+			}
+
+			source->Unlock(source);
+		}
 	}
-
-	scale(width, height, pitch, data, screen->pixels);
-
-	if (msg[0]) {
-		video_print_msg(screen->pixels, screen->h, screen->pitch / SCREEN_BPP, msg);
-		had_msg = 1;
-	}
-
-	SDL_UnlockSurface(screen);
 
 	video_update_msg();
 }
@@ -277,13 +394,13 @@ void plat_video_flip(void)
 				next_frame_time_us = time;
 			}
 
-			fb_flip();
+			fb_blit();
 
 			do {
 				next_frame_time_us += frame_time;
 			} while (next_frame_time_us < time);
 		} else {
-			fb_flip();
+			fb_blit();
 			next_frame_time_us = 0;
 		}
 
@@ -470,7 +587,6 @@ void plat_sound_resize_buffer(void) {
 		? current_audio_buffer_size * audio.in_sample_rate / frame_rate
 		: 0;
 
-		/* Dynamic adjustment keeps buffer 50% full, need double size */
 	if (enable_drc)
 		audio.buf_len *= 2;
 
@@ -518,32 +634,58 @@ int plat_init(void)
 {
 	plat_sound_write = plat_sound_write_nearest;
 
-	SDL_Init(SDL_INIT_VIDEO);
-	screen = SDL_SetVideoMode(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_BPP * 8,
-	                          SDL_HWSURFACE | SDL_DOUBLEBUF);
-	if (screen == NULL) {
-		PA_ERROR("%s, failed to set video mode\n", __func__);
+	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
+		PA_ERROR("SDL_Init: %s\n", SDL_GetError());
 		return -1;
 	}
-	
-	PA_INFO("flags=0x%08x HW=%d DBUF=%d\n", screen->flags,
-	        !!(screen->flags & SDL_HWSURFACE),
-	        !!(screen->flags & SDL_DOUBLEBUF));
+	SDL_ShowCursor(0);
 
-	if (screen->flags & SDL_HWSURFACE)
-	    printf("HWSURFACE enabled\n");
-	
-	if (screen->flags & SDL_DOUBLEBUF)
-	    printf("DOUBLEBUF enabled\n");
-		SDL_ShowCursor(0);
+	/* DirectFB 初始化 */
+	int dargc = 0; char **dargv = NULL;
+	if (DirectFBInit(&dargc, &dargv) != DFB_OK) {
+		PA_ERROR("DirectFBInit failed\n"); return -1;
+	}
+	if (DirectFBCreate(&dfb) != DFB_OK) {
+		PA_ERROR("DirectFBCreate failed\n"); return -1;
+	}
+	dfb->SetCooperativeLevel(dfb, DFSCL_FULLSCREEN);
 
-	g_menuscreen_w = SCREEN_WIDTH;
-	g_menuscreen_h = SCREEN_HEIGHT;
+	/* primary surface */
+	DFBSurfaceDescription pdsc = {
+		.flags = DSDESC_CAPS,
+		.caps  = DSCAPS_PRIMARY | DSCAPS_FLIPPING,
+	};
+	if (dfb->CreateSurface(dfb, &pdsc, &primary) != DFB_OK) {
+		PA_ERROR("primary CreateSurface failed\n"); return -1;
+	}
+	primary->GetSize(primary, &dfb_w, &dfb_h);
+	primary->Clear(primary, 0, 0, 0, 0xFF);
+	primary->Flip(primary, NULL, DSFLIP_NONE);
+
+	/* source surface 初始大小 = SCREEN，后续 ensure_source_size 按需调整 */
+	ensure_source_size(SCREEN_WIDTH, SCREEN_HEIGHT);
+	source_w = SCREEN_WIDTH;
+	source_h = SCREEN_HEIGHT;
+
+	/* screen: SDL software surface 作为菜单画布 + 截图用 */
+	screen = SDL_CreateRGBSurface(SDL_SWSURFACE,
+	                              SCREEN_WIDTH, SCREEN_HEIGHT, 16,
+	                              0xF800, 0x07E0, 0x001F, 0x0000);
+	if (!screen) {
+		PA_ERROR("CreateRGBSurface fail: %s\n", SDL_GetError());
+		return -1;
+	}
+
+	PA_INFO("DFB primary %dx%d, screen buf %dx%d bpp16 pitch %d\n",
+	        dfb_w, dfb_h, screen->w, screen->h, screen->pitch);
+
+	g_menuscreen_w  = SCREEN_WIDTH;
+	g_menuscreen_h  = SCREEN_HEIGHT;
 	g_menuscreen_pp = SCREEN_WIDTH;
 	g_menuscreen_ptr = NULL;
 
-	g_menubg_src_w = SCREEN_WIDTH;
-	g_menubg_src_h = SCREEN_HEIGHT;
+	g_menubg_src_w  = SCREEN_WIDTH;
+	g_menubg_src_h  = SCREEN_HEIGHT;
 	g_menubg_src_pp = SCREEN_WIDTH;
 
 	if (in_sdl_init(&in_sdl_platform_data, plat_sdl_event_handler)) {
@@ -552,15 +694,22 @@ int plat_init(void)
 	}
 	in_probe();
 
+#if PICOARCH_DISABLE_AUDIO
+	plat_sound_write = plat_sound_write_null;
+	PA_INFO("Audio disabled (PICOARCH_DISABLE_AUDIO=1)\n");
+#else
 	if (plat_sound_init()) {
 		PA_ERROR("SDL sound failed to init: %s\n", SDL_GetError());
 		return -1;
 	}
+#endif
+
 	return 0;
 }
 
 int plat_reinit(void)
 {
+#if !PICOARCH_DISABLE_AUDIO
 	if (sample_rate && sample_rate != audio.in_sample_rate) {
 		plat_sound_finish();
 
@@ -572,6 +721,7 @@ int plat_reinit(void)
 		plat_sound_resize_buffer();
 		plat_sound_select_resampler();
 	}
+#endif
 
 	if (frame_rate != 0)
 		frame_time = 1000000 / frame_rate;
@@ -582,8 +732,17 @@ int plat_reinit(void)
 
 void plat_finish(void)
 {
+#if !PICOARCH_DISABLE_AUDIO
 	plat_sound_finish();
-	SDL_FreeSurface(screen);
-	screen = NULL;
+#endif
+
+	if (source)  { source->Release(source);  source  = NULL; }
+	if (primary) { primary->Release(primary); primary = NULL; }
+	if (dfb)     { dfb->Release(dfb);        dfb     = NULL; }
+
+	source_surf_w = source_surf_h = 0;
+	source_w = source_h = 0;
+
+	if (screen)  { SDL_FreeSurface(screen);  screen  = NULL; }
 	SDL_Quit();
 }
