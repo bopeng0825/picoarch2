@@ -20,7 +20,7 @@ CFLAGS     += -I./ -I./libretro-common/include/ $(shell $(SYSROOT)/usr/bin/sdl-c
 GIT_REVISION ?= $(shell git rev-parse --short HEAD || echo unknown)
 CFLAGS += -DREVISION=\"$(GIT_REVISION)\"
 
-LDFLAGS    = -lc -ldl -lgcc -lm -lSDL -lasound -lpng -lz -Wl,--gc-sections -flto
+LDFLAGS    = -lc -ldl -lgcc -lm -lSDL -ldirectfb -lfusion -ldirect -lasound -lpng -lz -Wl,--gc-sections -flto
 
 # Unpolished or slow cores that build
 # EXTRA_CORES += mame2003_plus scummvm
