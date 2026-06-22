@@ -519,13 +519,23 @@ int plat_init(void)
 	plat_sound_write = plat_sound_write_nearest;
 
 	SDL_Init(SDL_INIT_VIDEO);
-	screen = SDL_SetVideoMode(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_BPP * 8, SDL_SWSURFACE);
+	screen = SDL_SetVideoMode(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_BPP * 8,
+	                          SDL_HWSURFACE | SDL_DOUBLEBUF);
 	if (screen == NULL) {
 		PA_ERROR("%s, failed to set video mode\n", __func__);
 		return -1;
 	}
+	
+	PA_INFO("flags=0x%08x HW=%d DBUF=%d\n", screen->flags,
+	        !!(screen->flags & SDL_HWSURFACE),
+	        !!(screen->flags & SDL_DOUBLEBUF));
 
-	SDL_ShowCursor(0);
+	if (screen->flags & SDL_HWSURFACE)
+	    printf("HWSURFACE enabled\n");
+	
+	if (screen->flags & SDL_DOUBLEBUF)
+	    printf("DOUBLEBUF enabled\n");
+		SDL_ShowCursor(0);
 
 	g_menuscreen_w = SCREEN_WIDTH;
 	g_menuscreen_h = SCREEN_HEIGHT;
